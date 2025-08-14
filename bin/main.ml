@@ -1,7 +1,7 @@
 open Compilerlib
 open Ast
 
-(* parse_program 和 read_input 函数保持不变 *)
+(* "parse_program" 是一个清晰的函数名，无需改动。 *)
 let parse_program (s : string) : func_def list =
   let lexbuf = Lexing.from_string s in
   try Parser.comp_unit Lexer.token lexbuf
@@ -14,44 +14,48 @@ let parse_program (s : string) : func_def list =
       line col token;
     exit 1
 
-let read_input () =
-  let rec aux acc =
-    try
-      let line = input_line stdin in
-      aux (line :: acc)
-    with End_of_file -> String.concat "\n" (List.rev acc)
-  in
-  aux []
-
 let () =
   Printexc.record_backtrace true;
 
-  (* 1. 使用 ref 定义需要被命令行设置的变量 *)
-  let print_liveness = ref false in
-  let bl_ir = ref false in
-  let opt_flag = ref false in
-  let print_alloc = ref false in
-
-  (* 2. 定义参数规格列表 *)
-  let speclist = [
-    ("-print-live", Arg.Set print_liveness, "Print liveness analysis results");
-    ("-block-ir", Arg.Set bl_ir, "Enable block-based IR generation");
-    ("-opt", Arg.Set opt_flag, "Enable optimizations (implies -block-ir)");
-    ("-print-alloc", Arg.Set print_alloc, "Print register allocation details");
-  ] in
-
-  (* 3. 定义使用说明 *)
-  let usage_msg = "Usage: toyc [options] < source.tc" in
-
-  (* 4. 执行解析 *)
-  Arg.parse speclist (fun _ -> ()) usage_msg;
-
-  (* 5. 根据解析结果设置最终的标志 *)
-  let optimize_enabled = !bl_ir || !opt_flag in
+  let read_input () =
+    let rec aux acc =
+      try
+        let line = input_line stdin in
+        aux (line :: acc)
+      with End_of_file -> String.concat "\n" (List.rev acc)
+    in
+    aux []
+  in
+  let args = Array.to_list Sys.argv |> List.tl in
   
-  (* 编译流程保持不变 *)
-  let input = read_input () in
-  let ast = parse_program input in
-  let ir = AstToIR.pro_ir ast optimize_enabled !print_liveness in
-  let asm = IrToAsm.com_pro ir !print_alloc in
-  Printf.printf "\n\n%s\n" asm
+  (* 为了更清晰，重命名了用于解析命令行参数的变量 *)
+  let print_liveness = List.exists (( = ) "-print-live") args in
+  let enable_block_ir = List.exists (( = ) "-block-ir") args in
+  let enable_optimizations_flag = List.exists (( = ) "-opt") args in
+  let print_allocation_details = List.exists (( = ) "-print-alloc") args in
+  
+  (* 逻辑保持不变，但变量名更清晰地表达了其用途 *)
+  let optimizations_enabled = enable_block_ir || enable_optimizations_flag in
+
+  let input_source = read_input () in
+
+  let ast = parse_program input_source in
+
+  (* 重命名函数调用，使其更易于理解 *)
+  let ir_program = AstToIR.translate_program_to_ir ast optimizations_enabled print_liveness in
+
+  let assembly_code = IrToAsm.compile_ir_to_asm ir_program print_allocation_details in
+
+  (* 保持打印到标准输出流 *)
+  Printf.printf "\n\n%s\n" assembly_code;
+
+  (* --- 新增代码开始 (最小化修改) --- *)
+  (* 将同样的内容写入 output.txt *)
+  try
+    let out_channel = open_out "output.txt" in
+    output_string out_channel assembly_code;
+    close_out out_channel
+  with Sys_error msg ->
+    Printf.eprintf "Error writing to output.txt: %s\n" msg
+  (* --- 新增代码结束 --- *)
+
