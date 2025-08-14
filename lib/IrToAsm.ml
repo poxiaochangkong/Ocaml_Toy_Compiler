@@ -10,7 +10,6 @@ let register_map : (string, string) Hashtbl.t = Hashtbl.create 256
 let spilled_variable_map : (operand, int) Hashtbl.t = Hashtbl.create 256
 
 let function_call_register_usage : (string, string list) Hashtbl.t = Hashtbl.create 16
-let temporary_register_pool = ref [ "t0"; "t1"; "t2"; "t3"; "t4"; "t5"; "t6" ]
 
 (* --- Helper Functions for Stack and Register Management --- *)
 
@@ -49,62 +48,50 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
     (inst : inst_r) (live_out_set : OperandSet.t) (callee_restore_code : string)
     (needs_frame : bool) : string =
   let temp_regs = ref [ "t5"; "t6"; "t4" ] in
-  let temp_reg_map = Hashtbl.create 3 in
 
-  let alloc_temp_reg (v : operand) : string =
+  let alloc_temp_reg () : string =
     match !temp_regs with
     | [] -> failwith "Ran out of temporary registers for spilling"
     | r :: rest ->
         temp_regs := rest;
-        Hashtbl.add temp_reg_map v r;
         r
+  in
+
+  (* Helper to materialize an operand into a register, handling spills. *)
+  let materialize_operand (op : operand) : string * string =
+    match O_hash.find_opt reg_alloc_map op with
+    | Some reg when reg <> "__SPILL__" -> ("", reg)
+    | _ ->
+        let tmp_reg = alloc_temp_reg () in
+        let var_name = match op with Var v -> "Var " ^ v | Reg v -> "Reg " ^ v | _ -> "?" in
+        let offset, debug_info =
+          try
+            let op_string = match op with Var x -> x | Reg x -> x | _ -> failwith "Cannot get string for Imm" in
+            (get_variable_offset op_string, "from_alloc_var")
+          with _ -> (allocate_spilled_slot op, "from_spill_var")
+        in
+        (Printf.sprintf "\tlw %s, %d(s0) # reload %s -- %s\n" tmp_reg offset var_name debug_info, tmp_reg)
   in
 
   let get_dest_register (op : operand) : string * string =
     match op with
     | Imm _ -> failwith "Immediate value cannot be a destination"
-    | _ -> (
-        match O_hash.find_opt reg_alloc_map op with
-        | Some reg when reg <> "__SPILL__" -> ("", reg)
-        | _ ->
-            let tmp_reg = alloc_temp_reg op in
-            let var_name = match op with Var v -> "Var " ^ v | Reg v -> "Reg " ^ v | _ -> "?" in
-            let offset, debug_info =
-              try
-                let op_string = match op with Var x -> x | Reg x -> x | _ -> failwith "" in
-                (get_variable_offset op_string, "from_alloc_var")
-              with _ -> (allocate_spilled_slot op, "from_spill_var")
-            in
-            (Printf.sprintf "\tlw %s, %d(s0) # reload %s -- %s\n" tmp_reg offset var_name debug_info, tmp_reg)
-      )
+    | _ -> materialize_operand op
   in
 
   let get_source_register (op : operand) : string * string =
     match op with
     | Imm i ->
-        let tmp_reg = alloc_temp_reg op in
+        let tmp_reg = alloc_temp_reg () in
         (Printf.sprintf "\tli %s, %d # tmp load imm \n" tmp_reg i, tmp_reg)
-    | _ -> (
-        match O_hash.find_opt reg_alloc_map op with
-        | Some reg when reg <> "__SPILL__" -> ("", reg)
-        | _ ->
-            let tmp_reg = alloc_temp_reg op in
-            let var_name = match op with Var v -> "Var " ^ v | Reg v -> "Reg " ^ v | _ -> "?" in
-            let offset, debug_info =
-              try
-                let op_string = match op with Var x -> x | Reg x -> x | _ -> failwith "" in
-                (get_variable_offset op_string, "from_alloc_var")
-              with _ -> (allocate_spilled_slot op, "from_spill_var")
-            in
-            (Printf.sprintf "\tlw %s, %d(s0) # reload %s -- %s\n" tmp_reg offset var_name debug_info, tmp_reg)
-      )
+    | _ -> materialize_operand op
   in
 
   let get_arg_register (op : operand) : string * string =
     match op with
     | Imm _ -> failwith "Immediate value cannot be a destination for arg"
-    | _ -> (
-        match O_hash.find_opt reg_alloc_map op with
+    | _ ->
+        (match O_hash.find_opt reg_alloc_map op with
         | Some reg when reg <> "__SPILL__" -> ("", reg)
         | _ ->
             let tmp_reg = "t6" in
@@ -115,9 +102,9 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
                 get_variable_offset op_string
               with _ -> allocate_spilled_slot op
             in
-            (Printf.sprintf "\tlw %s, %d(s0) # reload %s for arg\n" tmp_reg offset var_name, tmp_reg)
-      )
+            (Printf.sprintf "\tlw %s, %d(s0) # reload %s for arg\n" tmp_reg offset var_name, tmp_reg))
   in
+
   let generate_return_sequence =
     if needs_frame then
       Printf.sprintf
@@ -181,7 +168,7 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
         | _ -> failwith ("Unknown binop: " ^ op)
       in
       let store_code = store_dest_value dst dst_reg in
-      String.concat "" [ lhs_load; rhs_load; dst_load; op_code; store_code ]
+      dst_load ^ lhs_load ^ rhs_load ^ op_code ^ store_code
 
   | Unop (op, dst, src) ->
       let dst_load, dst_reg = get_dest_register dst in
@@ -198,27 +185,21 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
 
   | Assign (dst, src) ->
       let dst_load, dst_reg = get_dest_register dst in
-      (match src with
-      | Imm i ->
-          let body = Printf.sprintf "\tli %s, %d\n" dst_reg i in
-          let store_code = store_dest_value dst dst_reg in
-          dst_load ^ body ^ store_code
-      | _ ->
-          let src_load, src_reg = get_dest_register src in
-          let body = Printf.sprintf "\tmv %s, %s\n" dst_reg src_reg in
-          let store_code = store_dest_value dst dst_reg in
-          dst_load ^ src_load ^ body ^ store_code)
+      let src_load, src_reg = get_source_register src in
+      let body = Printf.sprintf "\tmv %s, %s\n" dst_reg src_reg in
+      let store_code = store_dest_value dst dst_reg in
+      dst_load ^ src_load ^ body ^ store_code
 
   | Load (dst, addr) ->
       let dst_load, dst_reg = get_dest_register dst in
-      let addr_load, addr_reg = get_dest_register addr in
+      let addr_load, addr_reg = get_source_register addr in
       let body = Printf.sprintf "\tlw %s, 0(%s)\n" dst_reg addr_reg in
       let store_code = store_dest_value dst dst_reg in
       dst_load ^ addr_load ^ body ^ store_code
 
   | Store (addr, value) ->
-      let addr_load, addr_reg = get_dest_register addr in
-      let val_load, val_reg = get_dest_register value in
+      let addr_load, addr_reg = get_source_register addr in
+      let val_load, val_reg = get_source_register value in
       addr_load ^ val_load ^ Printf.sprintf "\tsw %s, 0(%s)\n" val_reg addr_reg
 
   | Call (dst, fname, args) ->
@@ -253,7 +234,7 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
           !to_save
         |> String.concat ""
       in
-      let temp_reg_for_return = alloc_temp_reg (Var "__temp_moved") in
+      let temp_reg_for_return = alloc_temp_reg () in
       let move_return_to_temp = Printf.sprintf "\tmv %s, a0 # move a0 to temp_reg\n" temp_reg_for_return in
       let _, dst_reg = get_dest_register dst in
       let move_return_to_dest =
@@ -290,20 +271,22 @@ let compile_instruction_optimized (reg_alloc_map : string O_hash.t)
       | Imm 0 -> ""
       | Imm _ -> Printf.sprintf "\tj %s\n" label
       | _ ->
-          let cond_load, cond_reg = get_dest_register cond in
+          let cond_load, cond_reg = get_source_register cond in
           cond_load ^ Printf.sprintf "\tbnez %s, %s\n" cond_reg label)
 
   | Goto label -> Printf.sprintf "\tj %s\n" label
   | Label label -> Printf.sprintf "%s:\n" label
   | Ret None -> callee_restore_code ^ generate_return_sequence
   | Ret (Some op) ->
-      (match op with
-      | Imm i -> Printf.sprintf "\tli a0, %d\n" i
-      | _ ->
-          let ret_load, ret_reg = get_dest_register op in
-          let mv_code = if ret_reg = "a0" then "" else Printf.sprintf "\tmv a0, %s\n" ret_reg in
-          ret_load ^ mv_code)
-      ^ callee_restore_code ^ generate_return_sequence
+      let load_ret_val =
+        match op with
+        | Imm i -> Printf.sprintf "\tli a0, %d\n" i
+        | _ ->
+            let ret_load, ret_reg = get_source_register op in
+            let mv_code = if ret_reg = "a0" then "" else Printf.sprintf "\tmv a0, %s\n" ret_reg in
+            ret_load ^ mv_code
+      in
+      load_ret_val ^ callee_restore_code ^ generate_return_sequence
 
 let compile_instruction_legacy (inst : inst_r) (needs_frame : bool) : string =
   match inst with
@@ -474,10 +457,10 @@ let compile_function_legacy (f : func_r) : string =
   let func_label = f.name in
   let prologue =
     Printf.sprintf "%s:\n\taddi sp, sp, -%d\n" func_label stack_frame_size
-    ^ save_s0
-    ^ Printf.sprintf "\taddi s0, sp, %d\n" stack_frame_size
   in
-  prologue ^ save_ra ^ body_with_epilogue
+  prologue ^ save_s0
+  ^ Printf.sprintf "\taddi s0, sp, %d\n" stack_frame_size
+  ^ save_ra ^ body_with_epilogue
 
 
 let compile_function_optimized (f : ir_func_o) (print_alloc_details : bool) : string =
