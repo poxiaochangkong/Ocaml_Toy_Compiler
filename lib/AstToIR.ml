@@ -1,320 +1,232 @@
-(* astToIR.ml *)
+(* lib/AstToIR.ml - 已修正版本，并进行小幅函数式风格优化 *)
 open Ast
 open Ir
 open Op
 
-(* 环境模块，用于跟踪变量作用域 *)
-module SymbolTable = Map.Make (String)
+(* --- 模块与类型定义 (使用原始名称) --- *)
+module Enwli = Map.Make (String)
 
-module ScopeStack = struct
-  type t = operand SymbolTable.t list
+module Estack = struct
+  type t = operand Enwli.t list
 
-  let empty : t = [ SymbolTable.empty ]
-  let enter_scope (stk : t) : t = SymbolTable.empty :: stk
+  let empty : t = [ Enwli.empty ]
+  let enter (stk : t) : t = Enwli.empty :: stk
 
-  let exit_scope = function
+  let exit = function
     | _ :: tl -> tl
-    | [] -> failwith "ScopeStack.exit_scope: empty stack"
+    | [] -> failwith "Estack.exit: empty stack"
   ;;
 
-  let add_symbol name v = function
-    | top :: tl -> SymbolTable.add name v top :: tl
-    | [] -> failwith "ScopeStack.add_symbol: empty stack"
+  let add name v = function
+    | top :: tl -> Enwli.add name v top :: tl
+    | [] -> failwith "Estack.add: empty stack"
   ;;
 
-  let rec find_symbol name = function
+  let rec l_up name = function
     | [] -> failwith ("unbound variable: " ^ name)
     | m :: ms ->
-      (match SymbolTable.find_opt name m with
+      (match Enwli.find_opt name m with
        | Some v -> v
-       | None -> find_symbol name ms)
+       | None -> l_up name ms)
   ;;
 end
 
-(* 编译上下文，用于在递归翻译时传递状态 *)
-type translation_context =
-  { func_name : string
-  ; scope_stack : ScopeStack.t ref
-  ; break_label : string option
-  ; continue_label : string option
-  }
+type text = {
+  func_name : string;
+  e_stack : Estack.t ref;
+  breakb : string option;
+  continueb : string option;
+}
 
 module S_set = Set.Make (String)
 
-
-let rec has_side_effects_expr = function
+let rec side_effecte = function
   | Ast.Call _ -> true
-  | Ast.Unop (_, e) -> has_side_effects_expr e
-  | Ast.Binop (_, l, r) -> has_side_effects_expr l || has_side_effects_expr r
+  | Ast.Unop (_, e) -> side_effecte e
+  | Ast.Binop (_, l, r) -> side_effecte l || side_effecte r
   | _ -> false
 ;;
 
-let rec has_side_effects_stmt = function
-  | Ast.ExprStmt e -> has_side_effects_expr e
+let rec side_effects = function
+  | Ast.ExprStmt e -> side_effecte e
   | Ast.Return _ -> true
   | Ast.Break | Ast.Continue -> true
   | Ast.If (_, t, f) ->
-    has_side_effects_stmt t
-    ||
-    (match f with
-     | Some f -> has_side_effects_stmt f
-     | None -> false)
-  | Ast.While (_, b) -> has_side_effects_stmt b
-  | Ast.Block ss -> List.exists has_side_effects_stmt ss
+    side_effects t
+    || (match f with
+        | Some f -> side_effects f
+        | None -> false)
+  | Ast.While (_, b) -> side_effects b
+  | Ast.Block ss -> List.exists side_effects ss
   | _ -> false
-  ;;
+;;
 
-
-let rec contains_while_loop = function
+let rec c_while = function
   | [] -> false
   | Ast.While _ :: _ -> true
-  | Ast.Block ss :: rest -> contains_while_loop ss || contains_while_loop rest
-  | _ :: rest -> contains_while_loop rest
+  | Ast.Block ss :: rest -> c_while ss || c_while rest
+  | _ :: rest -> c_while rest
 ;;
 
-
-let rec is_constant_expr = function
-  | Number _ -> true
-  | Binop (_, e1, e2) -> is_constant_expr e1 && is_constant_expr e2
-  | _ -> false
-;;
-
-let rec find_used_vars_expr name = function
-  | ID id -> id = name
-  | Binop (_, e1, e2) -> find_used_vars_expr name e1 || find_used_vars_expr name e2
-  | Unop (_, e) -> find_used_vars_expr name e
-  | Call (_, args) -> List.exists (find_used_vars_expr name) args
-  | _ -> false
-;;
-
-let rec find_used_vars_stmt name stmt =
+let rec uvar_stmt name stmt =
+  let rec uvar_expr name = function
+    | ID id -> id = name
+    | Binop (_, e1, e2) -> uvar_expr name e1 || uvar_expr name e2
+    | Unop (_, e) -> uvar_expr name e
+    | Call (_, args) -> List.exists (uvar_expr name) args
+    | _ -> false
+  in
   match stmt with
-  | Ast.Assign (_, e) -> find_used_vars_expr name e
-  | Decl (_, Some e) -> find_used_vars_expr name e
-  | ExprStmt e -> find_used_vars_expr name e
+  | Ast.Assign (_, e) -> uvar_expr name e
+  | Decl (_, Some e) -> uvar_expr name e
+  | ExprStmt e -> uvar_expr name e
   | If (cond, s1, s2_opt) ->
-    find_used_vars_expr name cond
-    || find_used_vars_stmt name s1
-    ||
-    (match s2_opt with
-     | Some s2 -> find_used_vars_stmt name s2
-     | None -> false)
-  | While (cond, s) -> find_used_vars_expr name cond || find_used_vars_stmt name s
-  | Block ss -> List.exists (find_used_vars_stmt name) ss
+    uvar_expr name cond
+    || uvar_stmt name s1
+    || (match s2_opt with
+        | Some s2 -> uvar_stmt name s2
+        | None -> false)
+  | While (cond, s) -> uvar_expr name cond || uvar_stmt name s
+  | Block ss -> List.exists (uvar_stmt name) ss
   | _ -> false
 ;;
 
-let rec get_all_vars_expr = function
-  | Ast.ID x -> S_set.singleton x
-  | Ast.Unop (_, e) -> get_all_vars_expr e
-  | Ast.Binop (_, l, r) -> S_set.union (get_all_vars_expr l) (get_all_vars_expr r)
-  | Ast.Call (_, args) ->
-    List.fold_left
-      (fun acc e -> S_set.union acc (get_all_vars_expr e))
-      S_set.empty
-      args
-  | _ -> S_set.empty
-;;
-
-let rec get_all_vars_stmt = function
-  | Ast.ExprStmt e -> get_all_vars_expr e
-  | Ast.Return (Some e) -> get_all_vars_expr e
+let rec vars_stmt =
+  let rec vars_expr = function
+    | Ast.ID x -> S_set.singleton x
+    | Ast.Unop (_, e) -> vars_expr e
+    | Ast.Binop (_, l, r) -> S_set.union (vars_expr l) (vars_expr r)
+    | Ast.Call (_, args) ->
+      List.fold_left (fun acc e -> S_set.union acc (vars_expr e)) S_set.empty args
+    | _ -> S_set.empty
+  in
+  function
+  | Ast.ExprStmt e -> vars_expr e
+  | Ast.Return (Some e) -> vars_expr e
   | Ast.Return None -> S_set.empty
-  | Ast.Decl (_, Some e) -> get_all_vars_expr e
-  | Ast.Assign (_, e) -> get_all_vars_expr e
+  | Ast.Decl (_, Some e) -> vars_expr e
+  | Ast.Assign (_, e) -> vars_expr e
   | Ast.If (c, t, f) ->
     S_set.union
-      (get_all_vars_expr c)
+      (vars_expr c)
       (S_set.union
-         (get_all_vars_stmt t)
+         (vars_stmt t)
          (match f with
-          | Some f -> get_all_vars_stmt f
+          | Some f -> vars_stmt f
           | None -> S_set.empty))
-  | Ast.While (c, b) -> S_set.union (get_all_vars_expr c) (get_all_vars_stmt b)
+  | Ast.While (c, b) -> S_set.union (vars_expr c) (vars_stmt b)
   | Ast.Block ss ->
-    List.fold_left
-      (fun acc s -> S_set.union acc (get_all_vars_stmt s))
-      S_set.empty
-      ss
+    List.fold_left (fun acc s -> S_set.union acc (vars_stmt s)) S_set.empty ss
   | _ -> S_set.empty
 ;;
 
-
-let rec remove_dead_loops stmts =
-  let rec process_statements acc = function
+let rec r_while stmts =
+  let rec go acc = function
     | [] -> List.rev acc
     | stmt :: rest ->
-      let should_keep =
+      let keep1 =
         match stmt with
         | Ast.While (_, body) ->
-          let has_effects = has_side_effects_stmt body in
-          let written_vars = get_all_vars_stmt body in
-          let future_read_vars =
-            List.fold_left
-              (fun s st -> S_set.union s (get_all_vars_stmt st))
-              S_set.empty
-              rest
+          let se = side_effects body in
+          let writes = vars_stmt body in
+          let future_reads =
+            List.fold_left (fun s st -> S_set.union s (vars_stmt st)) S_set.empty rest
           in
-          has_effects || not (S_set.is_empty (S_set.inter written_vars future_read_vars))
+          not (not se && S_set.is_empty (S_set.inter writes future_reads))
         | Ast.Block _ -> true
         | _ -> true
       in
-      let new_acc =
-        if should_keep
-        then (
+      let acc1 =
+        if keep1 then
           let stmt' =
             match stmt with
-            | Ast.Block ss -> Ast.Block (remove_dead_loops ss)
+            | Ast.Block ss -> Ast.Block (r_while ss)
             | other -> other
           in
-          stmt' :: acc)
+          stmt' :: acc
         else acc
       in
-      process_statements new_acc rest
+      go acc1 rest
   in
-  process_statements [] stmts
+  go [] stmts
 ;;
 
-let preprocess_remove_dead_loops (cu : Ast.comp_unit) : Ast.comp_unit =
-  List.map
-    (fun f ->
-       if contains_while_loop f.Ast.body
-       then { f with Ast.body = remove_dead_loops f.Ast.body }
-       else f )
-    cu
+let pre_ast (cu : Ast.comp_unit) : Ast.comp_unit =
+  List.map (fun f -> if c_while f.Ast.body then { f with Ast.body = r_while f.body } else f) cu
 ;;
 
-let rec simplify_self_increment_loops stmt =
+let rec tri_self_loop stmt =
   match stmt with
-  | While (Binop (Less, ID var, Number _),
-           Block [Assign (var2, Binop (Add, ID var3, Number 1))])
-    when var = var2 && var = var3 ->
-    Block [] (* This loop only increments a local variable and does nothing else, can be removed. *)
-
-  | Block stmts ->
-    Block (stmts |> List.map simplify_self_increment_loops |> List.filter (function Block [] -> false | _ -> true))
-
-  | If (cond, s1, s2_opt) ->
-    If (
-      cond,
-      simplify_self_increment_loops s1,
-      Option.map simplify_self_increment_loops s2_opt
-    )
-
-  | While (cond, Block body) ->
-    While (cond, Block (List.map simplify_self_increment_loops body))
-
+  | While (Binop (Less, ID var, Number _), Block [ Assign (var2, Binop (Add, ID var3, Number 1)) ])
+    when var = var2 && var = var3 -> Block []
+  | Block stmts -> Block (stmts |> List.map tri_self_loop |> List.filter (function Block [] -> false | _ -> true))
+  | If (cond, s1, s2_opt) -> If (cond, tri_self_loop s1, Option.map tri_self_loop s2_opt)
+  | While (cond, Block body) -> While (cond, Block (List.map tri_self_loop body))
   | other -> other
 
-
-let rec strength_reduce_loops (stmt : stmt) : stmt =
+let rec el_loop (stmt : stmt) : stmt =
   match stmt with
   | While (Binop (Less, ID idx, Number n), Block body) ->
-    let match_inner_loop stmts =
+    let match_loop stmts =
       match stmts with
       | Decl (k_name, Some (Number 0)) :: assigns_before
-        when List.exists
-               (function
-                 | Ast.Assign (_, Number 0) -> true
-                 | _ -> false)
-               assigns_before ->
-        let a_inst, rest =
-          List.partition
-            (function
-              | Ast.Assign (_, Number 0) -> true
-              | _ -> false)
-            assigns_before
-        in
-        let acc_names =
-          List.filter_map
-            (function
-              | Ast.Assign (name, Number 0) -> Some name
-              | _ -> None)
-            a_inst
-        in
+        when List.exists (function Ast.Assign (_, Number 0) -> true | _ -> false) assigns_before ->
+        let a_inst, rest = List.partition (function Ast.Assign (_, Number 0) -> true | _ -> false) assigns_before in
+        let acc_names = List.filter_map (function Ast.Assign (name, Number 0) -> Some name | _ -> None) a_inst in
         (match rest with
-         | While (Binop (Less, ID k_id, Number m), Block inner_body) :: tail
-           when k_id = k_name ->
-           let valid_additions =
+         | While (Binop (Less, ID k_id, Number m), Block inner_body) :: tail when k_id = k_name ->
+           let vaild_expr =
              List.filter_map
                (function
-                 | Ast.Assign (acc, Binop (Add, ID acc2, expr))
-                   when acc = acc2 && List.mem acc acc_names -> Some (acc, expr)
+                 | Ast.Assign (acc, Binop (Add, ID acc2, expr)) when acc = acc2 && List.mem acc acc_names -> Some (acc, expr)
                  | _ -> None)
                inner_body
            in
-           let is_valid_reduction =
-             List.length valid_additions = List.length acc_names
-             && List.for_all
-                  (fun acc -> List.mem acc acc_names)
-                  (List.map fst valid_additions)
-           in
-           if is_valid_reduction then Some (k_name, m, valid_additions, tail) else None
+           let valid = List.length vaild_expr = List.length acc_names && List.for_all (fun acc -> List.mem acc acc_names) (List.map fst vaild_expr) in
+           if valid then Some (k_name, m, vaild_expr, tail) else None
          | _ -> None)
       | _ -> None
     in
-    (match match_inner_loop body with
+    (match match_loop body with
      | Some (k_var, m, acc_exprs, tail_after_loop) ->
-       let new_assignments =
-         List.map
-           (fun (acc, expr) -> Ast.Assign (acc, Binop (Mul, expr, Number m)))
-           acc_exprs
-       in
-       let k_decl =
-         if List.exists (find_used_vars_stmt k_var) tail_after_loop
-         then [ Decl (k_var, Some (Number 0)) ]
-         else []
-       in
-       let new_body =
-         Block (k_decl @ new_assignments @ List.map strength_reduce_loops tail_after_loop)
-       in
+       let new_accs = List.map (fun (acc, expr) -> Ast.Assign (acc, Binop (Mul, expr, Number m))) acc_exprs in
+       let k_decl = if List.exists (uvar_stmt k_var) tail_after_loop then [ Decl (k_var, Some (Number 0)) ] else [] in
+       let new_body = Block (k_decl @ new_accs @ List.map el_loop tail_after_loop) in
        While (Binop (Less, ID idx, Number n), new_body)
-     | None ->
-       While (Binop (Less, ID idx, Number n), Block (List.map strength_reduce_loops body)))
-  | While (cond, Block body) -> While (cond, Block (List.map strength_reduce_loops body))
-  | Block stmts -> Block (List.map strength_reduce_loops stmts)
-  | If (cond, t_branch, f_branch) ->
-    If (cond, strength_reduce_loops t_branch, Option.map strength_reduce_loops f_branch)
+     | None -> While (Binop (Less, ID idx, Number n), Block (List.map el_loop body)))
+  | While (cond, Block body) -> While (cond, Block (List.map el_loop body))
+  | Block stmts -> Block (List.map el_loop stmts)
+  | If (cond, t_branch, f_branch) -> If (cond, el_loop t_branch, Option.map el_loop f_branch)
   | _ -> stmt
 ;;
 
-let strength_reduce_loops_in_func (f : func_def) : func_def =
-  let new_body =
-    f.body
-    |> List.map strength_reduce_loops
-    |> List.map simplify_self_increment_loops
-  in
+let el_loopfunc (f : func_def) : func_def =
+  let new_body = f.body |> List.map el_loop |> List.map tri_self_loop in
   { f with body = new_body }
 ;;
 
-let optimize_loops_in_ast (cu : comp_unit) : comp_unit = List.map strength_reduce_loops_in_func cu
+let loop_elim_ast (cu : comp_unit) : comp_unit = List.map el_loopfunc cu
 
 module LabelMap = Map.Make (String)
 
 let temp_id = ref 0
-let fresh_temporary () =
-  let id = !temp_id in
+let fr_temp () =
   incr temp_id;
-  Reg ("t" ^ string_of_int id)
-;;
+  Reg ("t" ^ string_of_int !temp_id)
 
 let name_id = ref 0
-let fresh_variable_name base =
-  let id = !name_id in
+let fr_name base =
   incr name_id;
-  base ^ "_" ^ string_of_int id
-;;
+  base ^ "_" ^ string_of_int !name_id
 
-let label_id = ref 0
-let fresh_label () =
-  let id = !label_id in
-  incr label_id;
-  "L" ^ string_of_int id
-;;
-
+let la_id = ref 0
 let ir_label_id = ref 0
-let get_or_create_ir_label (label_map : string LabelMap.t) (l : param) : string * string LabelMap.t
-  =
+
+let fr_label () =
+  incr la_id;
+  "L" ^ string_of_int !la_id
+
+let frir_label (label_map : string LabelMap.t) (l : param) : string * string LabelMap.t =
   match LabelMap.find_opt l label_map with
   | Some lbl -> lbl, label_map
   | None ->
@@ -323,407 +235,279 @@ let get_or_create_ir_label (label_map : string LabelMap.t) (l : param) : string 
     let lbl = "LABEL" ^ string_of_int id in
     let label_map' = LabelMap.add l lbl label_map in
     lbl, label_map'
-;;
 
 let string_of_unop = function
-  | Not -> "!"
-  | Plus -> "+"
-  | Minus -> "-"
-;;
+  | Not -> "!" | Plus -> "+" | Minus -> "-"
 
 let string_of_binop = function
   | Add -> "+" | Sub -> "-" | Mul -> "*" | Div -> "/" | Mod -> "%"
   | Eq -> "==" | Neq -> "!=" | Less -> "<" | Leq -> "<=" | Greater -> ">"
   | Geq -> ">=" | Land -> "&&" | Lor -> "||"
-;;
 
-let rec translate_expression (ctx : translation_context) (e : expr) : operand * inst_r list =
+let rec expr_ir (ctx : text) (e : expr) : operand * inst_r list =
   match e with
-  | Number n -> Imm n, []
+  | Number n -> (Imm n, [])
   | ID name ->
-    let operand = ScopeStack.find_symbol name !(ctx.scope_stack) in
-    operand, []
+    let operand = Estack.l_up name !(ctx.e_stack) in
+    (operand, [])
   | Unop (op, e1) ->
-    let operand, code = translate_expression ctx e1 in
-    let res = fresh_temporary () in
-    res, code @ [ Unop (string_of_unop op, res, operand) ]
+    let operand, code = expr_ir ctx e1 in
+    let res = fr_temp () in
+    (res, code @ [ Unop (string_of_unop op, res, operand) ])
   | Binop (op, e1, e2) ->
-    let lhs, c1 = translate_expression ctx e1 in
-    let rhs, c2 = translate_expression ctx e2 in
-    let dst = fresh_temporary () in
-    dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ]
+    let lhs, c1 = expr_ir ctx e1 in
+    let rhs, c2 = expr_ir ctx e2 in
+    (match op with
+     | Land | Lor ->
+       let dst = fr_temp () in
+       (dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ])
+     | _ ->
+       let dst = fr_temp () in
+       (dst, c1 @ c2 @ [ Binop (string_of_binop op, dst, lhs, rhs) ]))
   | Call (f, args) ->
-    let codes, oprs =
-      List.fold_left
-        (fun (acc_code, acc_opr) arg ->
-           let opr, code = translate_expression ctx arg in
-           acc_code @ code, acc_opr @ [ opr ])
-        ([], [])
-        args
-    in
-    let ret = fresh_temporary () in
-    ret, codes @ [ Call (ret, f, oprs) ]
-;;
+    let arg_op_pairs = List.map (expr_ir ctx) args in
+    let oprs, codes_list = List.split arg_op_pairs in
+    let codes = List.concat codes_list in
+    let ret = fr_temp () in
+    (ret, codes @ [ Call (ret, f, oprs) ])
 
+type stmt_res = Returned of inst_r list | Normal of inst_r list
 
-type statement_translation_result =
-  | Normal of inst_r list
-  | Returned of inst_r list
+let flatten = function Returned code | Normal code -> code
+let always_returns = function Returned _ -> true | Normal _ -> false
+let junp_return insts = match List.rev insts with Goto _ :: _ | Ret _ :: _ -> true | _ -> false
 
-let flatten_result = function
-  | Normal code | Returned code -> code
-;;
-
-let always_returns (res : statement_translation_result) : bool =
-  match res with
-  | Returned _ -> true
-  | Normal _ -> false
-;;
-
-let ends_with_jump insts =
-  match List.rev insts with
-  | Goto _ :: _ -> true
-  | Ret _ :: _ -> true
-  | _ -> false
-;;
-
-
-let rec normalize_boolean_expr = function
-  | Ast.Unop (Not, Unop (Not, e)) -> normalize_boolean_expr e
-  | Unop (Not, Binop (Land, a, b)) ->
-    normalize_boolean_expr (Binop (Lor, Unop (Not, a), Unop (Not, b)))
-  | Unop (Not, Binop (Lor, a, b)) ->
-    normalize_boolean_expr (Binop (Land, Unop (Not, a), Unop (Not, b)))
+let rec nor_expr = function
+  | Ast.Unop (Not, Unop (Not, e)) -> nor_expr e
+  | Unop (Not, Binop (Land, a, b)) -> nor_expr (Binop (Lor, Unop (Not, a), Unop (Not, b)))
+  | Unop (Not, Binop (Lor, a, b)) -> nor_expr (Binop (Land, Unop (Not, a), Unop (Not, b)))
   | Unop (Not, Binop (op, a, b)) ->
-    let neg_op =
+    let neg =
       match op with
       | Eq -> Neq | Neq -> Eq | Less -> Geq | Leq -> Greater | Greater -> Leq | Geq -> Less
       | _ -> failwith "unsupported negation of this binary op"
     in
-    Ast.Binop (neg_op, normalize_boolean_expr a, normalize_boolean_expr b)
-  | Binop (op, a, b) -> Binop (op, normalize_boolean_expr a, normalize_boolean_expr b)
-  | Unop (op, a) -> Unop (op, normalize_boolean_expr a)
-  | Call (f, args) -> Call (f, List.map normalize_boolean_expr args)
+    Ast.Binop (neg, nor_expr a, nor_expr b)
+  | Binop (op, a, b) -> Binop (op, nor_expr a, nor_expr b)
+  | Unop (op, a) -> Unop (op, nor_expr a)
+  | Call (f, args) -> Call (f, List.map nor_expr args)
   | e -> e
-;;
 
-let rec desugar_statement = function
+let rec des_stmt = function
   | If (cond, then_b, Some else_b) ->
-    let cond = normalize_boolean_expr cond in
-    let and_clauses = spand cond in
-    if List.length and_clauses > 1
-    then (
+    let cond = nor_expr cond in
+    let ands = spand cond in
+    if List.length ands > 1 then
       let rec nest_and = function
         | [ x ] -> If (x, then_b, Some else_b)
         | hd :: tl -> If (hd, Block [ nest_and tl ], Some else_b)
         | [] -> Block []
       in
-      nest_and and_clauses |> desugar_statement)
-    else (
-      let or_clauses = spor cond in
-      if List.length or_clauses > 1
-      then (
+      nest_and ands |> des_stmt
+    else
+      let ors = spor cond in
+      if List.length ors > 1 then
         let rec nest_or = function
           | [ x ] -> If (x, then_b, Some else_b)
           | hd :: tl -> If (hd, then_b, Some (nest_or tl))
           | [] -> Block []
         in
-        nest_or or_clauses |> desugar_statement)
-      else If (cond, desugar_statement then_b, Some (desugar_statement else_b)))
+        nest_or ors |> des_stmt
+      else If (cond, des_stmt then_b, Some (des_stmt else_b))
   | If (cond, then_b, None) ->
-    let cond = normalize_boolean_expr cond in
-    let and_clauses = spand cond in
-    if List.length and_clauses > 1
-    then (
+    let cond = nor_expr cond in
+    let ands = spand cond in
+    if List.length ands > 1 then
       let rec nest_and = function
         | [ x ] -> If (x, then_b, None)
         | hd :: tl -> If (hd, Block [ nest_and tl ], None)
         | [] -> Block []
       in
-      nest_and and_clauses |> desugar_statement)
-    else (
-      let or_clauses = spor cond in
-      if List.length or_clauses > 1
-      then (
+      nest_and ands |> des_stmt
+    else
+      let ors = spor cond in
+      if List.length ors > 1 then
         let rec nest_or = function
           | [ x ] -> If (x, then_b, None)
           | hd :: tl -> If (hd, then_b, Some (nest_or tl))
           | [] -> Block []
         in
-        nest_or or_clauses |> desugar_statement)
-      else If (cond, desugar_statement then_b, None))
-  | While (cond, body) -> While (normalize_boolean_expr cond, desugar_statement body)
-  | Block ss -> Block (List.map desugar_statement ss)
+        nest_or ors |> des_stmt
+      else If (cond, des_stmt then_b, None)
+  | While (cond, body) -> While (nor_expr cond, des_stmt body)
+  | Block ss -> Block (List.map des_stmt ss)
   | other -> other
-;;
 
-let rec translate_statement (ctx : translation_context) (is_tail_pos : bool) (s : stmt) : statement_translation_result =
+let rec stmt_res (ctx : text) (in_tail : bool) (s : stmt) : stmt_res =
   match s with
   | Empty -> Normal []
   | ExprStmt e ->
-    let _, code = translate_expression ctx e in
+    let _, code = expr_ir ctx e in
     Normal code
   | Decl (x, None) ->
-    let new_name = fresh_variable_name x in
-    ctx.scope_stack := ScopeStack.add_symbol x (Var new_name) !(ctx.scope_stack);
+    let new_name = fr_name x in
+    ctx.e_stack := Estack.add x (Var new_name) !(ctx.e_stack);
     Normal []
   | Decl (x, Some e) ->
-    let v, c = translate_expression ctx e in
-    let new_name = fresh_variable_name x in
-    ctx.scope_stack := ScopeStack.add_symbol x (Var new_name) !(ctx.scope_stack);
+    let v, c = expr_ir ctx e in
+    let new_name = fr_name x in
+    ctx.e_stack := Estack.add x (Var new_name) !(ctx.e_stack);
     Normal (c @ [ Assign (Var new_name, v) ])
   | Assign (x, e) ->
-    let v, c = translate_expression ctx e in
-    let var_operand = ScopeStack.find_symbol x !(ctx.scope_stack) in
-    Normal (c @ [ Assign (var_operand, v) ])
-  | Return None -> if is_tail_pos then Returned [] else Returned [ Ret None ]
+    let v, c = expr_ir ctx e in
+    let var = Estack.l_up x !(ctx.e_stack) in
+    Normal (c @ [ Assign (var, v) ])
+  | Return None -> if in_tail then Returned [] else Returned [ Ret None ]
   | Return (Some e) ->
     (match e with
-     | Call (f, args) when f = ctx.func_name -> (* Tail call optimization *)
-       let arg_codes, arg_oprs =
-         List.fold_left
-           (fun (cc, oo) arg ->
-              let o, c = translate_expression ctx arg in
-              cc @ c, oo @ [ o ])
-           ([], [])
-           args
-       in
+     | Call (f, args) when f = ctx.func_name ->
+       let arg_op_pairs = List.map (expr_ir ctx) args in
+       let arg_oprs, codes_list = List.split arg_op_pairs in
+       let arg_codes = List.concat codes_list in
        Returned (arg_codes @ [ TailCall (f, arg_oprs) ])
      | _ ->
-       let r, code = translate_expression ctx e in
+       let r, code = expr_ir ctx e in
        Returned (code @ [ Ret (Some r) ]))
   | If (cond, tstmt, Some fstmt) ->
-    let cnd, cc = translate_expression ctx cond in
-    let lthen = fresh_label () and lelse = fresh_label () and lend = fresh_label () in
-    let then_res = translate_statement ctx is_tail_pos tstmt in
-    let else_res = translate_statement ctx is_tail_pos fstmt in
-    let raw_then = flatten_result then_res in
-    let then_code =
-      if ends_with_jump raw_then then raw_then else raw_then @ [ Goto lend ]
-    in
-    let raw_else = flatten_result else_res in
-    let else_code =
-      if ends_with_jump raw_else then raw_else else raw_else @ [ Goto lend ]
-    in
+    let cnd, cc = expr_ir ctx cond in
+    let lthen = fr_label () and lelse = fr_label () and lend = fr_label () in
+    let then_res = stmt_res ctx in_tail tstmt and else_res = stmt_res ctx in_tail fstmt in
+    let raw_then = flatten then_res in
+    let then_code = if junp_return raw_then then raw_then else raw_then @ [ Goto lend ] in
+    let raw_else = flatten else_res in
+    let else_code = if junp_return raw_else then raw_else else raw_else @ [ Goto lend ] in
     let code =
-      cc
-      @ [ IfGoto (cnd, lthen); Goto lelse ]
-      @ [ Label lthen ]
-      @ then_code
-      @ [ Label lelse ]
-      @ else_code
-      @ [ Label lend ]
+      cc @ [ IfGoto (cnd, lthen); Goto lelse ] @ [ Label lthen ] @ then_code
+      @ [ Label lelse ] @ else_code @ [ Label lend ]
     in
-    if always_returns then_res && always_returns else_res
-    then Returned code
-    else Normal code
+    if always_returns then_res && always_returns else_res then Returned code else Normal code
   | If (cond, tstmt, None) ->
-    let cnd, cc = translate_expression ctx cond in
-    let lthen = fresh_label () and lskip = fresh_label () in
-    let then_res = translate_statement ctx is_tail_pos tstmt in
-    let then_code = flatten_result then_res in
-    let code =
-      cc
-      @ [ IfGoto (cnd, lthen); Goto lskip ]
-      @ [ Label lthen ]
-      @ then_code
-      @ [ Label lskip ]
-    in
+    let cnd, cc = expr_ir ctx cond in
+    let lthen = fr_label () and lskip = fr_label () in
+    let then_res = stmt_res ctx in_tail tstmt in
+    let then_code = flatten then_res in
+    let code = cc @ [ IfGoto (cnd, lthen); Goto lskip ] @ [ Label lthen ] @ then_code @ [ Label lskip ] in
     Normal code
   | While (cond, body) ->
-    let lcond = fresh_label () and lbody = fresh_label () and lend = fresh_label () in
-    let ctx_loop = { ctx with break_label = Some lend; continue_label = Some lcond } in
-    let cnd, ccode = translate_expression ctx_loop cond in
-    let body_res = translate_statement ctx_loop false body in
-    let bcode = flatten_result body_res in
+    let lcond = fr_label () and lbody = fr_label () and lend = fr_label () in
+    let ctx_loop = { ctx with breakb = Some lend; continueb = Some lcond } in
+    let cnd, ccode = expr_ir ctx_loop cond in
+    let body_res = stmt_res ctx_loop false body in
+    let bcode = flatten body_res in
     let code =
-      [ Goto lcond; Label lcond ]
-      @ ccode
-      @ [ IfGoto (cnd, lbody); Goto lend ]
-      @ [ Label lbody ]
-      @ bcode
-      @ [ Goto lcond; Label lend ]
+      [ Goto lcond; Label lcond ] @ ccode @ [ IfGoto (cnd, lbody); Goto lend ]
+      @ [ Label lbody ] @ bcode @ [ Goto lcond; Label lend ]
     in
     Normal code
-  | Break ->
-    (match ctx.break_label with
-     | Some lbl -> Normal [ Goto lbl ]
-     | None -> failwith "break used outside loop")
-  | Continue ->
-    (match ctx.continue_label with
-     | Some lbl -> Normal [ Goto lbl ]
-     | None -> failwith "continue used outside loop")
+  | Break -> (match ctx.breakb with Some lbl -> Normal [ Goto lbl ] | None -> failwith "break used outside loop")
+  | Continue -> (match ctx.continueb with Some lbl -> Normal [ Goto lbl ] | None -> failwith "continue used outside loop")
   | Block stmts ->
-    ctx.scope_stack := ScopeStack.enter_scope !(ctx.scope_stack);
+    ctx.e_stack := Estack.enter !(ctx.e_stack);
     let rec loop acc = function
       | [] -> Normal acc
       | [ last ] ->
-        (match translate_statement ctx is_tail_pos last with
+        (match stmt_res ctx in_tail last with
          | Returned c -> Returned (acc @ c)
          | Normal c -> Normal (acc @ c))
       | hd :: tl ->
-        (match translate_statement ctx false hd with
+        (match stmt_res ctx false hd with
          | Returned c -> Returned (acc @ c)
          | Normal c -> loop (acc @ c) tl)
     in
     let res = loop [] stmts in
-    ctx.scope_stack := ScopeStack.exit_scope !(ctx.scope_stack);
+    ctx.e_stack := Estack.exit !(ctx.e_stack);
     res
-;;
 
-let partition_into_blocks (insts : inst_r list) : block_r list =
-  let rec split acc current_block_insts current_label label_map insts =
+let par_block (insts : inst_r list) : block_r list =
+  let rec split acc curr label label_map insts =
     match insts with
     | [] -> List.rev acc
     | Label l :: rest ->
-      (match current_block_insts with
+      (match curr with
        | [] ->
-         let next_label, label_map' = get_or_create_ir_label label_map l in
+         let next_label, label_map' = frir_label label_map l in
          split acc [ Label l ] next_label label_map' rest
        | _ ->
-         let next_label, label_map' = get_or_create_ir_label label_map l in
-         let blk =
-           { label = current_label
-           ; insts = List.rev current_block_insts
-           ; terminator = TermSeq next_label
-           ; preds = []
-           ; succs = []
-           ; l_in = OperandSet.empty
-           ; l_out = OperandSet.empty
-           }
-         in
-         let new_acc = blk :: acc in
-         split new_acc [ Label l ] next_label label_map' rest)
+         let next_label, label_map' = frir_label label_map l in
+         let blk = { label; insts = List.rev curr; terminator = TermSeq next_label; preds = []; succs = []; l_in = OperandSet.empty; l_out = OperandSet.empty } in
+         let acc1 = blk :: acc in
+         split acc1 [ Label l ] next_label label_map' rest)
     | Goto l :: rest ->
-      let goto_label, label_map' = get_or_create_ir_label label_map l in
-      let next_label, label_map'' =
-        get_or_create_ir_label label_map' ("__blk" ^ string_of_int !ir_label_id)
-      in
-      let blk =
-        { label = current_label
-        ; insts = List.rev (Goto l :: current_block_insts)
-        ; terminator = TermGoto goto_label
-        ; preds = []
-        ; succs = []
-        ; l_in = OperandSet.empty
-        ; l_out = OperandSet.empty
-        }
-      in
+      let goto_label, label_map' = frir_label label_map l in
+      let next_label, label_map'' = frir_label label_map' ("__blk" ^ string_of_int !ir_label_id) in
+      let blk = { label; insts = List.rev (Goto l :: curr); terminator = TermGoto goto_label; preds = []; succs = []; l_in = OperandSet.empty; l_out = OperandSet.empty } in
       split (blk :: acc) [] next_label label_map'' rest
     | IfGoto (cond, l) :: rest ->
-      let then_label, label_map' = get_or_create_ir_label label_map l in
-      let else_label, label_map'' =
-        get_or_create_ir_label label_map' ("__else" ^ string_of_int !ir_label_id)
-      in
-      let blk =
-        { label = current_label
-        ; insts = List.rev (IfGoto (cond, l) :: current_block_insts)
-        ; terminator = TermIf (cond, then_label, else_label)
-        ; preds = []
-        ; succs = []
-        ; l_in = OperandSet.empty
-        ; l_out = OperandSet.empty
-        }
-      in
+      let then_label, label_map' = frir_label label_map l in
+      let else_label, label_map'' = frir_label label_map' ("__else" ^ string_of_int !ir_label_id) in
+      let blk = { label; insts = List.rev (IfGoto (cond, l) :: curr); terminator = TermIf (cond, then_label, else_label); preds = []; succs = []; l_in = OperandSet.empty; l_out = OperandSet.empty } in
       split (blk :: acc) [] else_label label_map'' rest
     | Ret op :: rest ->
-      let next_label, label_map' =
-        get_or_create_ir_label label_map ("__ret" ^ string_of_int !ir_label_id)
-      in
-      let blk =
-        { label = current_label
-        ; insts = List.rev (Ret op :: current_block_insts)
-        ; terminator = TermRet op
-        ; preds = []
-        ; succs = []
-        ; l_in = OperandSet.empty
-        ; l_out = OperandSet.empty
-        }
-      in
+      let next_label, label_map' = frir_label label_map ("__ret" ^ string_of_int !ir_label_id) in
+      let blk = { label; insts = List.rev (Ret op :: curr); terminator = TermRet op; preds = []; succs = []; l_in = OperandSet.empty; l_out = OperandSet.empty } in
       split (blk :: acc) [] next_label label_map' rest
-    | inst :: rest -> split acc (inst :: current_block_insts) current_label label_map rest
+    | inst :: rest -> split acc (inst :: curr) label label_map rest
   in
-  let entry_label, label_map = get_or_create_ir_label LabelMap.empty "entry" in
+  let entry_label, label_map = frir_label LabelMap.empty "entry" in
   split [] [] entry_label label_map insts
-;;
 
-let translate_function_legacy (f : func_def) : func_r =
-  let desugared_body =
-    match desugar_statement (Block f.body) with
-    | Block ss -> ss
-    | _ -> f.body
-  in
-  let f' = { f with body = desugared_body } in
-  let initial_env = List.fold_left (fun m p -> SymbolTable.add p (Var p) m) SymbolTable.empty f'.params in
-  let initial_ctx =
-    { func_name = f'.func_name
-    ; scope_stack = ref [ initial_env ]
-    ; break_label = None
-    ; continue_label = None
-    }
-  in
-  let raw_result = translate_statement initial_ctx false (Block f'.body) in
-  let raw_code = flatten_result raw_result in
+let func_ir (f : func_def) : func_r =
+  let des_body = match des_stmt (Block f.body) with Block ss -> ss | _ -> f.body in
+  let f' = { f with body = des_body } in
+  let i_env = List.fold_left (fun m p -> Enwli.add p (Var p) m) Enwli.empty f'.params in
+  let ctx0 = { func_name = f'.func_name; e_stack = ref [ i_env ]; breakb = None; continueb = None } in
+  let raw_res = stmt_res ctx0 false (Block f'.body) in
+  let raw_code = flatten raw_res in
   let param_ops = List.map (fun p -> Var p) f'.params in
-  let entry_label = fresh_label () in
-  let code_with_entry = Label entry_label :: raw_code in
+  let en_lab = fr_label () in
+  let code_with_entry = Label en_lab :: raw_code in
   let final_code =
     List.concat_map
       (fun inst ->
          match inst with
          | TailCall (fname, args) when fname = f'.func_name ->
-           List.map2 (fun param_op arg_op -> Assign (param_op, arg_op)) param_ops args
-           @ [ Goto entry_label ]
+           List.map2 (fun param_op arg_op -> Assign (param_op, arg_op)) param_ops args @ [ Goto en_lab ]
          | _ -> [ inst ])
       code_with_entry
   in
   { name = f'.func_name; args = f'.params; body = final_code }
-;;
 
 let has_effect inst =
   match inst with
   | Call _ | Store _ | Ret _ -> true
   | Goto _ | IfGoto _ | Label _ -> true
   | _ -> false
-;;
 
-module ExprKey = struct
+module E_map = Map.Make (struct
   type t = string * operand * operand
   let compare = compare
-end
-module ExprMap = Map.Make(ExprKey)
+end)
 
-let common_subexpression_elimination_block (blk : block_r) : block_r =
-  let expr_table = ref ExprMap.empty in
+let cse_block (blk : block_r) : block_r =
+  let expr_table = ref E_map.empty in
   let new_insts =
     List.fold_left
       (fun acc inst ->
          match inst with
          | Binop (op, dst, lhs, rhs) ->
-           let key = (op, lhs, rhs) in
-           (match ExprMap.find_opt key !expr_table with
-            | Some prev_dst ->
-              Assign (dst, prev_dst) :: acc
+           let key = op, lhs, rhs in
+           (match E_map.find_opt key !expr_table with
+            | Some prev -> Assign (dst, prev) :: acc
             | None ->
-              expr_table := ExprMap.add key dst !expr_table;
+              expr_table := E_map.add key dst !expr_table;
               inst :: acc)
          | _ ->
-           let kills_all_expressions =
-             match inst with
-             | Store _ | Call _ | TailCall _ | Ret _ -> true
-             | _ -> false
-           in
-           if kills_all_expressions then expr_table := ExprMap.empty;
+           let kills_all = match inst with | Store _ | Call _ | TailCall _ | Ret _ -> true | _ -> false in
+           if kills_all then expr_table := E_map.empty;
            inst :: acc)
       []
       blk.insts
     |> List.rev
   in
   { blk with insts = new_insts }
-;;
 
-let dead_code_elimination blocks (print_liveness : bool) =
-  run_liveness_analysis blocks print_liveness;
+let dcode_elim blocks (print_l : bool) =
+  run_liveness_analysis blocks print_l;
   List.map
     (fun blk ->
        let live = ref blk.l_out in
@@ -732,12 +516,11 @@ let dead_code_elimination blocks (print_liveness : bool) =
            (fun inst acc ->
               let def, use = get_def_use_sets_for_instruction inst in
               let must_keep = has_effect inst in
-              let is_def_live =
+              let def_is_live =
                 (not (OperandSet.is_empty def))
                 && OperandSet.exists (fun v -> OperandSet.mem v !live) def
               in
-              if must_keep || is_def_live
-              then (
+              if must_keep || def_is_live then (
                 live := OperandSet.union use (OperandSet.diff !live def);
                 inst :: acc)
               else acc)
@@ -746,143 +529,112 @@ let dead_code_elimination blocks (print_liveness : bool) =
        in
        { blk with insts = new_insts })
     blocks
-;;
 
-module OperandMap = Map.Make (struct
+module O_map = Map.Make (struct
   type t = operand
   let compare = compare
 end)
 
-let rec resolve_copy env op =
+let rec res_copy env op =
   match op with
   | Var _ | Reg _ ->
-    (match OperandMap.find_opt op env with
-     | Some v when v <> op -> resolve_copy env v
+    (match O_map.find_opt op env with
+     | Some v when v <> op -> res_copy env v
      | _ -> op)
   | _ -> op
-;;
 
-let copy_propagation_block (blk : block_r) : block_r =
-  let copy_env = ref OperandMap.empty in
-  let propagate_op op = resolve_copy !copy_env op in
+let copy_block (blk : block_r) : block_r =
+  let copy_env = ref O_map.empty in
+  let propagate_op op = res_copy !copy_env op in
   let new_insts =
     List.filter_map
       (fun inst ->
          match inst with
          | Assign (dst, src) ->
            let src' = propagate_op src in
-           if dst = src'
-           then None
-           else (
-             copy_env := OperandMap.add dst src' !copy_env;
-             Some (Assign (dst, src')))
+           if dst = src' then None
+           else (copy_env := O_map.add dst src' !copy_env; Some (Assign (dst, src')))
          | Binop (op, dst, lhs, rhs) ->
-           let lhs' = propagate_op lhs in
-           let rhs' = propagate_op rhs in
-           copy_env := OperandMap.remove dst !copy_env;
-           Some (Binop (op, dst, lhs', rhs'))
+           let lhs' = propagate_op lhs and rhs' = propagate_op rhs in
+           copy_env := O_map.remove dst !copy_env; Some (Binop (op, dst, lhs', rhs'))
          | Unop (op, dst, src) ->
            let src' = propagate_op src in
-           copy_env := OperandMap.remove dst !copy_env;
-           Some (Unop (op, dst, src'))
+           copy_env := O_map.remove dst !copy_env; Some (Unop (op, dst, src'))
          | Load (dst, src) ->
            let src' = propagate_op src in
-           copy_env := OperandMap.remove dst !copy_env;
-           Some (Load (dst, src'))
+           copy_env := O_map.remove dst !copy_env; Some (Load (dst, src'))
          | Store (dst, src) ->
-           let dst' = propagate_op dst in
-           let src' = propagate_op src in
+           let dst' = propagate_op dst and src' = propagate_op src in
            Some (Store (dst', src'))
-         | Ret (Some src) ->
-           let src' = propagate_op src in
-           Some (Ret (Some src'))
+         | Ret (Some src) -> Some (Ret (Some (propagate_op src)))
          | Call (dst, fname, args) ->
            let args' = List.map propagate_op args in
-           copy_env := OperandMap.remove dst !copy_env;
-           Some (Call (dst, fname, args'))
-         | TailCall (fname, args) ->
-           let args' = List.map propagate_op args in
-           Some (TailCall (fname, args'))
-         | Goto _ | IfGoto _ | Label _ | Ret None -> Some inst)
+           copy_env := O_map.remove dst !copy_env; Some (Call (dst, fname, args'))
+         | TailCall (fname, args) -> Some (TailCall (fname, List.map propagate_op args))
+         | (Goto _ | IfGoto _ | Label _ | Ret None) as i -> Some i)
       blk.insts
   in
   { blk with insts = new_insts }
-;;
 
-let translate_function_optimized (f : func_def) (print_liveness : bool) : ir_func_o =
-  let desugared_body =
-    match desugar_statement (Block f.body) with
-    | Block ss -> ss
-    | _ -> f.body
-  in
-  let f' = { f with body = desugared_body } in
-  let initial_env = List.fold_left (fun m p -> SymbolTable.add p (Var p) m) SymbolTable.empty f'.params in
-  let initial_ctx =
-    { func_name = f'.func_name
-    ; scope_stack = ref [ initial_env ]
-    ; break_label = None
-    ; continue_label = None
-    }
-  in
+let func_iro (f : func_def) (print_l : bool) : ir_func_o =
+  let des_body = match des_stmt (Block f.body) with Block ss -> ss | _ -> f.body in
+  let f' = { f with body = des_body } in
+  let i_env = List.fold_left (fun m p -> Enwli.add p (Var p) m) Enwli.empty f'.params in
+  let ctx0 = { func_name = f'.func_name; e_stack = ref [ i_env ]; breakb = None; continueb = None } in
   let raw_code =
-    try translate_statement initial_ctx false (Block f'.body) |> flatten_result with
+    try stmt_res ctx0 false (Block f'.body) |> flatten with
     | e ->
-      Printf.eprintf
-        "Error generating IR for %s: %s\n"
-        f'.func_name
-        (Printexc.to_string e);
+      Printf.eprintf "Error generating IR for %s: %s\n" f'.func_name (Printexc.to_string e);
       raise e
   in
-  let entry_label = "entry_" ^ f'.func_name in
-  let tail_elim_ir = ref [ Label entry_label ] in
+  let en_lab = "entry_" ^ f'.func_name in
+  let tail_elim_ir = ref [ Label en_lab ] in
   List.iter
     (fun inst ->
        match inst with
        | TailCall (fname, args) when fname = f'.func_name ->
-         let assigns =
-           List.mapi
-             (fun i arg ->
-                let param = List.nth f'.params i in
-                Assign (Var param, arg))
-             args
-         in
-         tail_elim_ir := !tail_elim_ir @ assigns @ [ Goto entry_label ]
+         let assigns = List.mapi (fun i arg -> let param = List.nth f'.params i in Assign (Var param, arg)) args in
+         tail_elim_ir := !tail_elim_ir @ assigns @ [ Goto en_lab ]
        | _ -> tail_elim_ir := !tail_elim_ir @ [ inst ])
     raw_code;
-  let raw_blocks = partition_into_blocks !tail_elim_ir in
+  let raw_blocks = par_block !tail_elim_ir in
   let cfg_blocks = Cfg.build_cfg raw_blocks in
   let opt_blocks = Cfg.optimize_cfg cfg_blocks in
-  let dce_blocks = dead_code_elimination opt_blocks print_liveness in
-  let cse_blocks = List.map common_subexpression_elimination_block dce_blocks in
-  let copy_blocks = List.map copy_propagation_block cse_blocks in
-  let final_blocks = dead_code_elimination copy_blocks print_liveness in
+  let dce_blocks = dcode_elim opt_blocks print_l in
+  let cse_blocks = List.map cse_block dce_blocks in
+  let copy_blocks = List.map copy_block cse_blocks in
+  let final_blocks = dcode_elim copy_blocks print_l in
   { name = f'.func_name; args = f'.params; blocks = final_blocks }
-;;
 
-
-let rec optimize_ast_statements stmt =
+let rec opt_stmt stmt =
   match stmt with
-  | While (cond, body) ->
-    While (cond, optimize_ast_statements body)
-  | Block slist -> Block (List.map optimize_ast_statements slist)
-  | If (e, s1, Some s2) -> If (e, optimize_ast_statements s1, Some (optimize_ast_statements s2))
-  | If (e, s1, None) -> If (e, optimize_ast_statements s1, None)
+  | While (cond, body) -> While (cond, opt_stmt body)
+  | Block slist -> Block (List.map opt_stmt slist)
+  | If (e, s1, Some s2) -> If (e, opt_stmt s1, Some (opt_stmt s2))
+  | If (e, s1, None) -> If (e, opt_stmt s1, None)
   | _ -> stmt
-;;
 
-let optimize_ast_function (f : func_def) : func_def =
-  { f with body = List.map optimize_ast_statements f.body }
-;;
+let opt_func (f : func_def) : func_def = { f with body = List.map opt_stmt f.body }
+let opt (prog : comp_unit) : comp_unit = List.map opt_func prog
 
-let optimize_ast (prog : comp_unit) : comp_unit = List.map optimize_ast_function prog
-
-(* The main function to translate the whole program to IR *)
-let translate_program_to_ir (cu : comp_unit) (optimize_flag : bool) (print_liveness : bool)
-  : ir_program
-  =
-  let optimized_cu = if optimize_flag then cu |> preprocess_remove_dead_loops |> optimize_loops_in_ast |> optimize_ast |> optimize_loops_in_ast else cu in
-  let optimized_cu = optimize_ast optimized_cu in
+(* ========== 步骤 2: 优化点 ========== *)
+let translate_program_to_ir (cu : comp_unit) (optimize_flag : bool) (print_l : bool) : ir_program =
+  (* 之前: 优化流程分两步，并且重复绑定变量 cu1 *)
+  (* let cu1 = if optimize_flag then cu |> pre_ast |> loop_elim_ast |> opt |> loop_elim_ast else cu in
+  let cu1 = opt cu1 in *)
+  
+  (* 之后: 将所有优化步骤合并成一个清晰的流水线 *)
+  let processed_cu =
+    if optimize_flag then
+      cu
+      |> pre_ast
+      |> loop_elim_ast
+      |> opt
+      |> loop_elim_ast
+      |> opt
+    else
+      cu
+  in
   if optimize_flag
-  then Ir_funcs_o (List.map (fun f -> translate_function_optimized f print_liveness) optimized_cu)
-  else Ir_funcs (List.map translate_function_legacy optimized_cu)
-;;
+  then Ir_funcs_o (List.map (fun f -> func_iro f print_l) processed_cu)
+  else Ir_funcs (List.map func_ir processed_cu)
