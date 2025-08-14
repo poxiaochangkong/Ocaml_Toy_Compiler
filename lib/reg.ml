@@ -1,101 +1,77 @@
 open Ir
 
+(* A custom hash table for operands, allowing Var, Reg, and Imm to be used as keys. *)
 module O_key = struct
   type t = operand
-
   let equal a b =
     match (a, b) with
-    | Var x, Var y -> String.equal x y
-    | Reg x, Reg y -> String.equal x y
+    | Var x, Var y | Reg x, Reg y -> String.equal x y
     | Imm x, Imm y -> x = y
     | _, _ -> false
-
   let hash = function
     | Var x -> Hashtbl.hash ("var", x)
     | Reg x -> Hashtbl.hash ("reg", x)
     | Imm i -> Hashtbl.hash ("imm", i)
 end
-
 module O_hash = Hashtbl.Make (O_key)
 
+(* The set of available physical registers for allocation. *)
+let physical_registers =
+  [| "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7";
+     "t0"; "t1"; "t2"; "t3";
+     "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11" |]
+let number_of_physical_registers = Array.length physical_registers
 
-let spi_map : (operand, int) Hashtbl.t = Hashtbl.create 32
-let stack_count = ref 0
-
-let k_registers = 8 + 4 + 11
-
-let phy_reg =
-  [|
-    "a0";
-    "a1";
-    "a2";
-    "a3";
-    "a4";
-    "a5";
-    "a6";
-    "a7";
-    "t0";
-    "t1";
-    "t2";
-    "t3";
-    "s1";
-    "s2";
-    "s3";
-    "s4";
-    "s5";
-    "s6";
-    "s7";
-    "s8";
-    "s9";
-    "s10";
-    "s11";
-  |]
-
-  type inter = {
+(* Represents the live interval of a variable (operand). *)
+type live_interval = {
   name : operand;
-  mutable start : int;
-  mutable end_ : int;
-  is_param : bool;
+  mutable start_point : int;
+  mutable end_point : int;
+  is_parameter : bool;
 }
 
-let b_inter (f : ir_func_o) : inter list =
-  let reg_inters = Hashtbl.create 128 in
-  let block_pos = Hashtbl.create 64 in
+(* Step 1: Build live intervals for all variables from liveness analysis data. *)
+let build_live_intervals (f : ir_func_o) : live_interval list =
+  let intervals_map = Hashtbl.create 128 in
+  let block_positions = Hashtbl.create 64 in
   let counter = ref 0 in
 
+  (* Assign a unique position to each block for interval calculation. *)
   List.iter
     (fun block ->
       incr counter;
-      Hashtbl.add block_pos block.label !counter)
+      Hashtbl.add block_positions block.label !counter)
     f.blocks;
 
-  let par_oper op =
+  let is_function_parameter op =
     match op with Var name -> List.mem name f.args | _ -> false
   in
 
-  let add_live v pos =
-    let op = v in
-    match Hashtbl.find_opt reg_inters op with
-    | Some i ->
-        i.start <- min i.start pos;
-        i.end_ <- max i.end_ pos
+  (* Update or create a live interval for a variable at a given position. *)
+  let update_interval var pos =
+    match Hashtbl.find_opt intervals_map var with
+    | Some interval ->
+        interval.start_point <- min interval.start_point pos;
+        interval.end_point <- max interval.end_point pos
     | None ->
-        let i =
-          { name = op; start = pos; end_ = pos; is_param = par_oper op }
+        let interval =
+          { name = var; start_point = pos; end_point = pos; is_parameter = is_function_parameter var }
         in
-        Hashtbl.add reg_inters op i
+        Hashtbl.add intervals_map var interval
   in
 
+  (* Iterate through all blocks and their live-in/live-out sets to build intervals. *)
   List.iter
     (fun block ->
-      let pos = Hashtbl.find block_pos block.label in
-      OperandSet.iter (fun v -> add_live v pos) block.l_in;
-      OperandSet.iter (fun v -> add_live v pos) block.l_out)
+      let pos = Hashtbl.find block_positions block.label in
+      OperandSet.iter (fun v -> update_interval v pos) block.l_in;
+      OperandSet.iter (fun v -> update_interval v pos) block.l_out)
     f.blocks;
 
-  Hashtbl.fold (fun _ itv acc -> itv :: acc) reg_inters []
+  Hashtbl.fold (fun _ interval acc -> interval :: acc) intervals_map []
 
-let print_reg reg_map : unit =
+(* Helper to print the result of register allocation for debugging. *)
+let print_allocation_result reg_map : unit =
   Printf.printf "=== Register Allocation Result ===\n";
   O_hash.iter
     (fun op reg ->
@@ -108,54 +84,55 @@ let print_reg reg_map : unit =
       Printf.printf "%-10s -> %s\n" name reg)
     reg_map
 
+(* Step 2: Run the linear scan register allocation algorithm. *)
+let run_linear_scan_allocation (intervals : live_interval list) (print_details : bool) =
+  (* Sort intervals by their starting point. *)
+  let sorted_intervals = List.sort (fun a b -> compare a.start_point b.start_point) intervals in
+  let active_intervals : live_interval list ref = ref [] in
 
-let lin_alloca (inters : inter list) (p_alloca : bool) =
-  let inters = List.sort (fun a b -> compare a.start b.start) inters in
-  let active : inter list ref = ref [] in
+  let assigned_registers = O_hash.create 32 in
+  let final_allocation_map = O_hash.create 512 in
 
-  let reg_map = O_hash.create 32 in
-  let alloc_map = O_hash.create 512 in
-
-  let exp_inter current =
-    active :=
+  (* Expire old intervals from the active list that no longer overlap with the current one. *)
+  let expire_old_intervals current =
+    active_intervals :=
       List.filter
         (fun itv ->
-          if itv.end_ >= current.start then true
+          if itv.end_point >= current.start_point then true
           else (
-            O_hash.remove reg_map itv.name;
+            (* This interval has ended, so its register is now free. *)
+            O_hash.remove assigned_registers itv.name;
             false))
-        !active
+        !active_intervals
   in
 
   List.iter
-    (fun itv ->
-      exp_inter itv;
+    (fun current_interval ->
+      expire_old_intervals current_interval;
 
-      if itv.is_param then (
-        O_hash.add reg_map itv.name "__SPILL__";
-        O_hash.replace alloc_map itv.name "__SPILL__")
-      else if List.length !active = k_registers then (
-        (if
-           p_alloca
-         then
-           let name =
-             match itv.name with Reg r | Var r -> r | Imm _ -> "imm"
-           in
-           Printf.printf "Spill: %s\n" name);
-        O_hash.add reg_map itv.name "__SPILL__";
-        O_hash.replace alloc_map itv.name "__SPILL__")
+      if current_interval.is_parameter then (
+        (* Parameters passed on the stack are marked for spilling immediately. *)
+        O_hash.add assigned_registers current_interval.name "__SPILL__";
+        O_hash.replace final_allocation_map current_interval.name "__SPILL__")
+      else if List.length !active_intervals = number_of_physical_registers then (
+        (* No free registers, must spill. *)
+        if print_details then
+           let name = match current_interval.name with Reg r | Var r -> r | Imm _ -> "imm" in
+           Printf.printf "Spilling variable: %s\n" name;
+        O_hash.add assigned_registers current_interval.name "__SPILL__";
+        O_hash.replace final_allocation_map current_interval.name "__SPILL__")
       else
-        let used_regs =
-          O_hash.fold (fun _ r acc -> r :: acc) reg_map []
-        in
-        let avail =
+        (* Find an available physical register. *)
+        let used_regs = O_hash.fold (fun _ r acc -> r :: acc) assigned_registers [] in
+        let available_reg =
           List.find
             (fun r -> not (List.mem r used_regs))
-            (Array.to_list phy_reg)
+            (Array.to_list physical_registers)
         in
-        O_hash.add reg_map itv.name avail;
-        O_hash.replace alloc_map itv.name avail;
-        active := itv :: !active)
-    inters;
-  if p_alloca then print_reg alloc_map;
-  alloc_map
+        O_hash.add assigned_registers current_interval.name available_reg;
+        O_hash.replace final_allocation_map current_interval.name available_reg;
+        active_intervals := current_interval :: !active_intervals)
+    sorted_intervals;
+
+  if print_details then print_allocation_result final_allocation_map;
+  final_allocation_map

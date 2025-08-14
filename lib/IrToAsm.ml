@@ -403,7 +403,7 @@ let compile_block (blk : block_r) (reg_alloc_map : string O_hash.t)
 
   List.iter
     (fun inst ->
-      let def, use = Op.def_inst inst in
+      let def, use = Op.get_def_use_sets_for_instruction inst in
       let l_out = !live in
       let i_code =
         compile_instruction_optimized reg_alloc_map inst l_out callee_restore_code
@@ -486,9 +486,9 @@ let compile_function_optimized (f : ir_func_o) (print_alloc_details : bool) : st
   Hashtbl.clear spilled_variable_map;
   stack_offset := 0;
 
-  Op.liv_analy f.blocks print_alloc_details;
-  let intervals = b_inter f in
-  let reg_alloc_map = lin_alloca intervals print_alloc_details in
+  Op.run_liveness_analysis f.blocks print_alloc_details;
+  let intervals = build_live_intervals f in
+  let reg_alloc_map = run_linear_scan_allocation intervals print_alloc_details in
   let used_caller_saved =
     let caller_saved_regs = [ "t0";"t1";"t2";"t3";"t4";"t5";"t6";"a1";"a2";"a3";"a4";"a5";"a6";"a7" ] in
     O_hash.fold

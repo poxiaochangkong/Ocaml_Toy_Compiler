@@ -1,4 +1,4 @@
-(* AstToIR.ml *)
+(* astToIR.ml *)
 open Ast
 open Ir
 open Op
@@ -723,14 +723,14 @@ let common_subexpression_elimination_block (blk : block_r) : block_r =
 ;;
 
 let dead_code_elimination blocks (print_liveness : bool) =
-  liv_analy blocks print_liveness;
+  run_liveness_analysis blocks print_liveness;
   List.map
     (fun blk ->
        let live = ref blk.l_out in
        let new_insts =
          List.fold_right
            (fun inst acc ->
-              let def, use = def_inst inst in
+              let def, use = get_def_use_sets_for_instruction inst in
               let must_keep = has_effect inst in
               let is_def_live =
                 (not (OperandSet.is_empty def))
