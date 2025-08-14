@@ -1,0 +1,18 @@
+(library
+ (name compilerlib))
+
+(rule
+ (targets parser.ml parser.mli parser.output)
+ (deps parser.mly)
+ (action
+  (chdir
+   %{workspace_root}
+   (run ocamlyacc -v lib/parser.mly))))
+
+(rule
+ (targets lexer.ml)
+ (deps lexer.mll)
+ (action
+  (chdir
+   %{workspace_root}
+   (run ocamllex -o lib/lexer.ml lib/lexer.mll))))
