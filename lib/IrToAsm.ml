@@ -1,5 +1,5 @@
 open Ir
-open Reg
+open Linearscan
 
 (* --- Module-level State and Configuration --- *)
 
@@ -386,7 +386,7 @@ let compile_block (blk : block_r) (reg_alloc_map : string O_hash.t)
 
   List.iter
     (fun inst ->
-      let def, use = Op.get_def_use_sets_for_instruction inst in
+      let def, use = Liveness.get_def_use_sets_for_instruction inst in
       let l_out = !live in
       let i_code =
         compile_instruction_optimized reg_alloc_map inst l_out callee_restore_code
@@ -469,7 +469,7 @@ let compile_function_optimized (f : ir_func_o) (print_alloc_details : bool) : st
   Hashtbl.clear spilled_variable_map;
   stack_offset := 0;
 
-  Op.run_liveness_analysis f.blocks print_alloc_details;
+  Liveness.run_liveness_analysis f.blocks print_alloc_details;
   let intervals = build_live_intervals f in
   let reg_alloc_map = run_linear_scan_allocation intervals print_alloc_details in
   let used_caller_saved =

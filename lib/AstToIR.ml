@@ -1,7 +1,7 @@
 (* lib/AstToIR.ml - 已修正版本，并进行小幅函数式风格优化 *)
 open Ast
 open Ir
-open Op
+open Liveness
 
 (* --- 模块与类型定义 (使用原始名称) --- *)
 module Enwli = Map.Make (String)
